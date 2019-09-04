@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #include <net/if.h>
 
@@ -24,6 +25,7 @@
 #include <linux/can/raw.h>
 
 #define CAN_ID_DEFAULT	(2)
+#define DEFAULT_DATA_BYTES (1)
 
 extern int optind, opterr, optopt;
 
@@ -38,6 +40,12 @@ static bool use_poll = false;
 static unsigned int loopcount = 1;
 static int verbose;
 
+static int receive = 0;
+static FILE *fh = NULL;
+static int received_frames = 0;
+static int sequence_missmatches = 0;
+static char *filename = NULL;
+
 static struct can_frame frame = {
 	.can_dlc = 1,
 };
@@ -47,7 +55,6 @@ static struct can_filter filter[] = {
 enum {
 	VERSION_OPTION = CHAR_MAX + 1,
 };
-
 
 static void print_usage(char *prg)
 {
@@ -67,18 +74,35 @@ static void print_usage(char *prg)
 		" -q  --quit <num>	quit if <num> wrong sequences are encountered\n"
 		" -v, --verbose		be verbose (twice to be even more verbose\n"
 		" -h  --help		this help\n"
-		"     --version		print version information and exit\n",
-		prg, CAN_ID_DEFAULT);
+		"     --version		print version information and exit\n"
+                " -d, --datalen=LEN     specify the bytes send (default = 1)\n"
+                " -f, --file=filename   file to write received frames to\n"
+		, prg, CAN_ID_DEFAULT);
 }
+
+static void prepare_quit(void) {
+	if (receive) {
+		printf("statistic: totally received frames: %d, sequence missmatches: %d\n", received_frames, sequence_missmatches);
+		if (fh != NULL)
+			fprintf(fh, "statistic: totally received frames: %d, sequence missmatches: %d\n", received_frames, sequence_missmatches);
+	}
+	if (fh != NULL) {
+		fclose(fh);
+	}
+}
+
 
 static void sigterm(int signo)
 {
-	running = false;
+	printf("received Signal: %u, will gracefully stop!\n", signo);
+	running = 0;
+	prepare_quit();
+	exit(EXIT_SUCCESS);
 }
-
 
 static void do_receive()
 {
+
 	uint8_t ctrlmsg[CMSG_SPACE(sizeof(struct timeval)) + CMSG_SPACE(sizeof(__u32))];
 	struct iovec iov = {
 		.iov_base = &frame,
@@ -93,6 +117,15 @@ static void do_receive()
 	unsigned int seq_wrap = 0;
 	uint8_t sequence = 0;
 	ssize_t nbytes;
+
+	if (filename != NULL && receive == 1) {
+		printf("open %s to dump received frames.\n", filename);
+		fh = fopen("fileopen","w+");
+		if(fh == NULL) {
+			perror("open file for writing");
+			exit(EXIT_FAILURE);
+		}
+	}
 
 	if (setsockopt(s, SOL_SOCKET, SO_RXQ_OVFL,
 		       &dropmonitor_on, sizeof(dropmonitor_on)) < 0) {
@@ -121,13 +154,19 @@ static void do_receive()
 			sequence = frame.data[0];
 		}
 
+		if (fh != NULL)
+			fprintf(fh, "received frame. sequence number: %d\n", frame.data[0]);
+
 		if (verbose > 1)
 			printf("received frame. sequence number: %d\n", frame.data[0]);
+		
+		received_frames++;
 
 		if (frame.data[0] != sequence) {
 			uint32_t overflows = 0;
 
 			drop_count++;
+			sequence_missmatches++;
 
 			for (cmsg = CMSG_FIRSTHDR(&msg);
 			     cmsg && (cmsg->cmsg_level == SOL_SOCKET);
@@ -138,8 +177,10 @@ static void do_receive()
 				}
 			}
 
-			fprintf(stderr, "[%d] received wrong sequence count. expected: %d, got: %d, socket overflows: %u\n",
-				drop_count, sequence, frame.data[0], overflows);
+			fprintf(stderr, "[%d] received wrong sequence count. expected: %d, got: %d, socket overflows: %u\n", drop_count, sequence, frame.data[0], overflows);
+			if (fh != NULL)
+				fprintf(stderr, "[%d] received wrong sequence count. expected: %d, got: %d, socket overflows: %u\n", drop_count, sequence, frame.data[0], overflows);
+				
 
 			if (drop_count == drop_until_quit)
 				exit(EXIT_FAILURE);
@@ -148,6 +189,9 @@ static void do_receive()
 		}
 
 		sequence++;
+		if (fh != NULL && !sequence)
+			fprintf(fh,"sequence wrap around (%d)\n", seq_wrap);
+
 		if (verbose && !sequence)
 			printf("sequence wrap around (%d)\n", seq_wrap++);
 
@@ -158,9 +202,15 @@ static void do_send()
 {
 	unsigned int seq_wrap = 0;
 	uint8_t sequence = 0;
+	uint32_t send_frames = 0;
+	struct timeval tv;
+	gettimeofday(&tv,NULL);
+	uint32_t timestamp_start_sending_us = 1000000 * tv.tv_sec + tv.tv_usec;
 
 	while ((infinite || loopcount--) && running) {
 		ssize_t len;
+		
+		send_frames++;
 
 		if (verbose > 1)
 			printf("sending frame. sequence number: %d\n", sequence);
@@ -200,9 +250,20 @@ static void do_send()
 		(unsigned char)frame.data[0]++;
 		sequence++;
 
-		if (verbose && !sequence)
-			printf("sequence wrap around (%d)\n", seq_wrap++);
+		if (!(send_frames % 10000))
+			printf("%d frames send\n", send_frames);
+
+		if (verbose) {
+			if (!sequence)
+				printf("sequence wrap around (%d)\n", seq_wrap++);
+		}
 	}
+	
+	gettimeofday(&tv,NULL);
+	uint32_t timestamp_end_sending_us = 1000000 * tv.tv_sec + tv.tv_usec;
+	uint32_t time_sending = timestamp_end_sending_us - timestamp_start_sending_us;
+	uint32_t time_per_frame = time_sending / send_frames;
+	printf("send %u frames in %fs (takes %u us per frame)\n", send_frames, ((float) time_sending)/1000000.0f, time_per_frame);
 }
 
 int main(int argc, char **argv)
@@ -211,12 +272,14 @@ int main(int argc, char **argv)
 	struct sockaddr_can addr;
 	char *interface = "can0";
 	int family = PF_CAN, type = SOCK_RAW, proto = CAN_RAW;
+	int nbytes = DEFAULT_DATA_BYTES;
 	int extended = 0;
-	int receive = 0;
 	int opt;
 
+	signal(SIGINT, sigterm);
 	signal(SIGTERM, sigterm);
 	signal(SIGHUP, sigterm);
+
 
 	struct option long_options[] = {
 		{ "extended",	no_argument,		0, 'e' },
@@ -228,10 +291,12 @@ int main(int argc, char **argv)
 		{ "version",	no_argument,		0, VERSION_OPTION},
 		{ "identifier",	required_argument,	0, 'i' },
 		{ "loop",	required_argument,	0, 'l' },
+		{ "datalen",    required_argument,      0, 'd' },
+		{ "file",       required_argument,      0, 'f' },
 		{ 0,		0,			0, 0},
 	};
 
-	while ((opt = getopt_long(argc, argv, "ehpq:rvi:l:", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "ehpq:rvi:l:d:f:", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'e':
 			extended = true;
@@ -277,6 +342,23 @@ int main(int argc, char **argv)
 
 		case 'i':
 			filter->can_id = strtoul(optarg, NULL, 0);
+			break;
+
+		case 'd':
+			nbytes = strtoul(optarg, NULL, 0);
+			if (nbytes > 8) {
+				nbytes = 8;
+			}
+			frame.can_dlc = nbytes;
+			break;
+
+		case 'f':
+			printf("\n%s\n", optarg);
+			filename = optarg;
+			if (filename == NULL) {
+				printf("filename not valid\n");
+				exit(EXIT_FAILURE);
+			}
 			break;
 
 		default:
@@ -331,5 +413,6 @@ int main(int argc, char **argv)
 	else
 		do_send();
 
+	prepare_quit();
 	exit(EXIT_SUCCESS);
 }
